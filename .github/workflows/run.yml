@@ -1,78 +1,124 @@
+name: RDP-Larger-Runner
 
-name: Windows RDP (Ngrok)
 on:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 85
-    
+  secure-rdp:
+    # Sử dụng GitHub Larger Runner
+    # Các tùy chọn: 4-core-windows, 8-core-windows, 16-core-windows
+    runs-on: windows-latest-16-core
+    timeout-minutes: 360
+
     steps:
-    - uses: actions/checkout@v4
+      - name: Display System Information
+        run: |
+          Write-Host "=== SYSTEM INFORMATION ==="
+          Get-ComputerInfo | Select-Object CsName, CsNumberOfProcessors, CsNumberOfLogicalProcessors, CsTotalPhysicalMemory, OsArchitecture
+          Write-Host "`nDisk Space:"
+          Get-PSDrive C | Select-Object Name, @{N="Used(GB)";E={[math]::Round($_.Used/1GB,2)}}, @{N="Free(GB)";E={[math]::Round($_.Free/1GB,2)}}, @{N="Total(GB)";E={[math]::Round(($_.Used+$_.Free)/1GB,2)}}
+          Write-Host "==========================`n"
 
-    - name: Setup System
-      run: |
-        netsh int tcp set global congestionprovider=ctcp
-        choco install googlechrome 7zip -y --no-progress --ignore-checksums
-    
-    - name: Configure Access
-      shell: pwsh
-      run: |
-        $secpw = ConvertTo-SecureString "Vps@wKsba6vC@7" -AsPlainText -Force
-        Set-LocalUser -Name "runneradmin" -Password $secpw
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-    - name: Enable RDP
-      shell: pwsh
-      run: |
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Type DWord -Force
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Type DWord -Force
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-    - name: Setup Ngrok
-      shell: pwsh
-      run: |
-        for ($i = 0; $i -lt 5; $i++) {
-          try {
-            Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip -TimeoutSec 60
-            break
-          } catch { Start-Sleep -Seconds 5 }
-        }
-        Expand-Archive ngrok.zip -DestinationPath . -Force
-        .\ngrok.exe config add-authtoken "ngrok config add-authtoken $YOUR_AUTHTOKEN"
-        Start-Process -FilePath ".\ngrok.exe" -ArgumentList "tcp","--region","ap","3389" -WindowStyle Hidden
-        Start-Sleep -Seconds 20
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
-    - name: Export Info
-      shell: pwsh
-      run: |
-        $ngrokUrl = ""
-        for ($i = 0; $i -lt 60; $i++) {
-          try { 
-            $tunnels = Invoke-RestMethod -Uri http://localhost:4040/api/tunnels -TimeoutSec 10
-            if ($tunnels.tunnels.Count -gt 0) {
-              $ngrokUrl = $tunnels.tunnels[0].public_url.Replace("tcp://", "").Trim()
-              break
-            }
-          } catch {}
-          Start-Sleep -Seconds 2
-        }
-        if ($ngrokUrl) {
-          "$ngrokUrl|Vps@wKsba6vC@7" | Out-File -FilePath "info.txt" -Encoding UTF8 -NoNewline
-        } else {
-          "ERROR|Ngrok tunnel not found" | Out-File -FilePath "info.txt" -Encoding UTF8 -NoNewline
-        }
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
-    - name: Upload Result
-      uses: actions/upload-artifact@v4
-      with:
-        name: result
-        path: info.txt
-        retention-days: 1
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-    - name: Keep Alive
-      shell: pwsh
-      run: |
-        for ($i = 1; $i -le 60; $i++) {
-          Start-Sleep -Seconds 60
-        }
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=windows-green-cloud-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS (16-CORE LARGER RUNNER) ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Specs: 16 vCPU cores | 64GB RAM | 600GB SSD"
+          Write-Host "=========================================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
